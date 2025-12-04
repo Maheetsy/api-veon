@@ -2,117 +2,218 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\FirebaseService;
 use Illuminate\Http\Request;
-use Kreait\Firebase\Factory;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Log;
 
 class ProviderController extends Controller
 {
-    protected $firestore;
-    protected $collectionName = 'providers';
+    protected $firebaseService;
 
-    public function __construct()
+    public function __construct(FirebaseService $firebaseService)
     {
-        // Ruta al archivo JSON de credenciales
-        $credentialsPath = base_path(env('FIREBASE_CREDENTIALS'));
-
-        // Inicializamos Firestore
-        $factory = (new Factory)->withServiceAccount($credentialsPath);
-        
-        // Aquí es donde te daba el error antes si no tenías la librería instalada
-        $this->firestore = $factory->createFirestore()->database();
+        $this->firebaseService = $firebaseService;
     }
 
     /**
      * Display a listing of the resource.
+     * GET /api/providers
      */
-    public function index()
+    public function index(Request $request)
     {
         try {
-            $documents = $this->firestore->collection($this->collectionName)->documents();
-            $providers = [];
-
-            foreach ($documents as $document) {
-                if ($document->exists()) {
-                    $data = $document->data();
-                    $data['id'] = $document->id();
-                    $providers[] = $data;
-                }
+            // Si el usuario está autenticado, filtrar por userId
+            $userId = null;
+            if ($request->user()) {
+                // Opcional: solo mostrar proveedores del usuario actual
+                // $userId = $request->user()->id;
             }
-            return response()->json($providers);
+            
+            $providers = $this->firebaseService->getProviders($userId);
+            
+            Log::info('Providers listados', ['count' => count($providers)]);
+            
+            return response()->json([
+                'message' => 'Proveedores obtenidos exitosamente',
+                'data' => $providers,
+            ]);
         } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+            Log::error('Error en index: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Error al obtener proveedores',
+                'message' => $e->getMessage()
+            ], 500);
         }
     }
 
     /**
      * Store a newly created resource in storage.
+     * POST /api/providers
      */
     public function store(Request $request)
     {
-        try {
-            $data = $request->all();
-            // Validamos que no venga vacío (básico)
-            if(empty($data)) {
-                 return response()->json(['message' => 'No data provided'], 400);
-            }
+        Log::info('Creando provider', $request->all());
+        
+        $validator = Validator::make($request->all(), [
+            'companyName' => 'required|string|max:255',
+            'contactName' => 'required|string|max:255',
+            'email' => 'required|email|max:255',
+            'phoneNumber' => 'required|string|max:20',
+            'address' => 'required|string|max:255',
+            'city' => 'required|string|max:100',
+            'state' => 'required|string|max:100',
+            'postalCode' => 'required|string|max:10',
+            'country' => 'required|string|max:100',
+            'userId' => 'nullable', // Removed exists:users,id
+        ]);
 
-            $data['createdAt'] = now()->toIso8601String();
-            $newDoc = $this->firestore->collection($this->collectionName)->add($data);
+        if ($validator->fails()) {
+            Log::warning('Validation failed', $validator->errors()->toArray());
+            return response()->json([
+                'error' => 'Validation failed',
+                'messages' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            // Si no se envía userId, usar el del usuario autenticado
+            $data = $request->all();
+            if (!isset($data['userId']) && $request->user()) {
+                $data['userId'] = $request->user()->id;
+            }
+            
+            $provider = $this->firebaseService->createProvider($data);
+
+            Log::info('Provider creado', ['id' => $provider['id']]);
 
             return response()->json([
-                'message' => 'Proveedor creado',
-                'id' => $newDoc->id()
+                'message' => 'Proveedor creado exitosamente',
+                'data' => $provider,
             ], 201);
         } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+            Log::error('Error en store: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Error al crear proveedor',
+                'message' => $e->getMessage()
+            ], 500);
         }
     }
 
     /**
      * Display the specified resource.
+     * GET /api/providers/{id}
      */
     public function show(string $id)
     {
         try {
-            $doc = $this->firestore->collection($this->collectionName)->document($id)->snapshot();
+            $provider = $this->firebaseService->getProvider($id);
 
-            if (!$doc->exists()) {
-                return response()->json(['message' => 'Proveedor no encontrado'], 404);
+            if (!$provider) {
+                return response()->json([
+                    'error' => 'Proveedor no encontrado'
+                ], 404);
             }
 
-            $data = $doc->data();
-            $data['id'] = $doc->id();
-            return response()->json($data);
+            Log::info('Provider obtenido', ['id' => $id]);
+
+            return response()->json([
+                'message' => 'Proveedor obtenido exitosamente',
+                'data' => $provider,
+            ]);
         } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+            Log::error('Error obteniendo provider', ['id' => $id, 'error' => $e->getMessage()]);
+            return response()->json([
+                'error' => 'Error al obtener proveedor',
+                'message' => $e->getMessage()
+            ], 500);
         }
     }
 
     /**
      * Update the specified resource in storage.
+     * PUT /api/providers/{id}
      */
     public function update(Request $request, string $id)
     {
-        try {
-            $docRef = $this->firestore->collection($this->collectionName)->document($id);
-            $docRef->set($request->all(), ['merge' => true]); // Merge evita borrar campos que no envíes
+        Log::info('Actualizando provider', ['id' => $id, 'data' => $request->all()]);
+        
+        $data = $request->all();
+        $mappedData = [
+            'companyName' => $data['companyName'] ?? $data['company_name'] ?? null,
+            'contactName' => $data['contactName'] ?? $data['contact_name'] ?? null,
+            'email' => $data['email'] ?? null,
+            'phoneNumber' => $data['phoneNumber'] ?? $data['phone_number'] ?? null,
+            'address' => $data['address'] ?? null,
+            'city' => $data['city'] ?? null,
+            'state' => $data['state'] ?? null,
+            'postalCode' => $data['postalCode'] ?? $data['postal_code'] ?? null,
+            'country' => $data['country'] ?? null,
+            'userId' => $data['userId'] ?? $data['user_id'] ?? null,
+        ];
 
-            return response()->json(['message' => 'Proveedor actualizado correctamente']);
+        // Filter out nulls to allow partial updates
+        $mappedData = array_filter($mappedData, function($value) { return !is_null($value); });
+
+        $validator = Validator::make($mappedData, [
+            'companyName' => 'sometimes|required|string|max:255',
+            'contactName' => 'sometimes|required|string|max:255',
+            'email' => 'sometimes|required|email|max:255',
+            'phoneNumber' => 'sometimes|required|string|max:20',
+            'address' => 'sometimes|required|string|max:255',
+            'city' => 'sometimes|required|string|max:100',
+            'state' => 'sometimes|required|string|max:100',
+            'postalCode' => 'sometimes|required|string|max:10',
+            'country' => 'sometimes|required|string|max:100',
+            'userId' => 'sometimes|nullable',
+        ]);
+
+        if ($validator->fails()) {
+            Log::warning('Validation failed', $validator->errors()->toArray());
+            return response()->json([
+                'error' => 'Validation failed',
+                'messages' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            $provider = $this->firebaseService->updateProvider($id, $mappedData);
+
+            Log::info('Provider actualizado', ['id' => $id]);
+
+            return response()->json([
+                'message' => 'Proveedor actualizado exitosamente',
+                'data' => $provider,
+            ]);
         } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+            Log::error('Error actualizando provider', ['id' => $id, 'error' => $e->getMessage()]);
+            return response()->json([
+                'error' => 'Error al actualizar proveedor',
+                'message' => $e->getMessage()
+            ], 404);
         }
     }
 
     /**
      * Remove the specified resource from storage.
+     * DELETE /api/providers/{id}
      */
     public function destroy(string $id)
     {
         try {
-            $this->firestore->collection($this->collectionName)->document($id)->delete();
-            return response()->json(['message' => 'Proveedor eliminado']);
+            $this->firebaseService->deleteProvider($id);
+
+            Log::info('Provider eliminado', ['id' => $id]);
+
+            return response()->json([
+                'message' => 'Proveedor eliminado exitosamente',
+            ]);
         } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+            Log::error('Error eliminando provider', ['id' => $id, 'error' => $e->getMessage()]);
+            return response()->json([
+                'error' => 'Error al eliminar proveedor',
+                'message' => $e->getMessage()
+            ], 404);
         }
     }
 }

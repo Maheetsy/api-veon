@@ -2,109 +2,150 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\FirebaseService;
 use Illuminate\Http\Request;
-use Kreait\Firebase\Factory;
-use Kreait\Firebase\Exception\Auth\EmailExists;
-use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Log;
 
 class AuthController extends Controller
 {
-    protected $auth;
-    protected $firestore;
+    protected $firebaseService;
 
-    public function __construct()
+    public function __construct(FirebaseService $firebaseService)
     {
-        // Como ya arreglaste XAMPP, podemos cargar todo nativo
-        $factory = (new Factory)->withServiceAccount(base_path(env('FIREBASE_CREDENTIALS')));
-        
-        $this->auth = $factory->createAuth();
-        $this->firestore = $factory->createFirestore()->database();
+        $this->firebaseService = $firebaseService;
     }
 
-    // REGISTRO: Crea Auth + Documento en Firestore 'users'
+    /**
+     * Registro de usuario
+     */
     public function register(Request $request)
     {
-        $request->validate([
-            'name' => 'required|string',
-            'email' => 'required|email',
-            'password' => 'required|min:6',
+        Log::info('📝 Register attempt', [
+            'email' => $request->email,
+            'name' => $request->name
         ]);
 
+        // Validación
+        $validator = Validator::make($request->all(), [
+            'name' => 'required|string|max:255',
+            'email' => 'required|string|email|max:255',
+            'password' => 'required|string|min:6',
+        ]);
+
+        if ($validator->fails()) {
+            Log::warning('❌ Validation failed', $validator->errors()->toArray());
+            return response()->json([
+                'error' => 'Validation failed',
+                'messages' => $validator->errors()
+            ], 422);
+        }
+
         try {
-            // 1. Crear el usuario en el sistema de Autenticación
-            $userProperties = [
-                'email' => $request->email,
-                'emailVerified' => false,
-                'password' => $request->password,
-                'displayName' => $request->name,
-                'disabled' => false,
-            ];
-
-            $createdUser = $this->auth->createUser($userProperties);
-
-            // 2. Guardar los datos extra en la colección 'users' (Gracias a gRPC esto es fácil)
-            $userData = [
-                'id' => $createdUser->uid,
+            // Crear usuario en Firebase (Auth + Firestore)
+            // Note: We pass raw password because Firebase Auth handles hashing
+            $user = $this->firebaseService->createUser([
                 'name' => $request->name,
                 'email' => $request->email,
-                'createdAt' => now()->toIso8601String(),
-                'updatedAt' => now()->toIso8601String(),
-            ];
+                'password' => $request->password, 
+            ]);
 
-            // Guardamos en la colección 'users' usando el UID como llave del documento
-            $this->firestore->collection('users')->document($createdUser->uid)->set($userData);
+            // Crear token interno para la API
+            $token = $this->firebaseService->createToken($user['id']);
+
+            Log::info('✅ Register successful', ['user_id' => $user['id']]);
 
             return response()->json([
-                'message' => 'Usuario registrado correctamente',
-                'uid' => $createdUser->uid
+                'message' => 'Usuario registrado exitosamente',
+                'user' => $user,
+                'token' => $token,
             ], 201);
 
-        } catch (EmailExists $e) {
-            return response()->json(['error' => 'Este correo ya está registrado'], 400);
         } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+            Log::error('❌ Register error', ['error' => $e->getMessage()]);
+            return response()->json([
+                'error' => 'Error al registrar usuario',
+                'message' => $e->getMessage()
+            ], 500);
         }
     }
 
-    // LOGIN: Validar contraseña y devolver token
+    /**
+     * Login de usuario
+     */
     public function login(Request $request)
     {
-        $request->validate([
+        Log::info('🔐 Login attempt', [
+            'email' => $request->email,
+            'ip' => $request->ip()
+        ]);
+
+        // Validación
+        $validator = Validator::make($request->all(), [
             'email' => 'required|email',
             'password' => 'required',
         ]);
 
+        if ($validator->fails()) {
+            Log::warning('❌ Validation failed', $validator->errors()->toArray());
+            return response()->json([
+                'error' => 'Validation failed',
+                'messages' => $validator->errors()
+            ], 422);
+        }
+
         try {
-            // NOTA: El SDK de Admin NO permite loguear con contraseña (es por seguridad).
-            // Usamos la API REST de Google solo para este paso.
-            $apiKey = env('FIREBASE_API_KEY');
-            
-            $response = Http::post("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={$apiKey}", [
-                'email' => $request->email,
-                'password' => $request->password,
-                'returnSecureToken' => true
-            ]);
+            // Autenticar con Firebase Auth
+            $user = $this->firebaseService->loginUser($request->email, $request->password);
 
-            if ($response->failed()) {
-                return response()->json(['message' => 'Credenciales incorrectas'], 401);
-            }
+            // Crear token interno
+            $token = $this->firebaseService->createToken($user['id']);
 
-            $authData = $response->json();
-            $uid = $authData['localId'];
-
-            // 3. (Opcional) Traemos los datos del usuario desde Firestore para devolverlos
-            // Esto confirma que tu conexión a la BD 'users' funciona perfecto
-            $userDoc = $this->firestore->collection('users')->document($uid)->snapshot();
-            $userData = $userDoc->exists() ? $userDoc->data() : [];
+            Log::info('✅ Login successful', ['user_id' => $user['id']]);
 
             return response()->json([
                 'message' => 'Login exitoso',
-                'token' => $authData['idToken'], // Token para que Flutter lo use
-                'user' => $userData
-            ]);
+                'user' => $user,
+                'token' => $token,
+            ], 200);
 
         } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+            Log::error('❌ Login error', ['error' => $e->getMessage()]);
+            
+            // Check if it's a credential error
+            if (str_contains($e->getMessage(), 'INVALID_PASSWORD') || str_contains($e->getMessage(), 'EMAIL_NOT_FOUND')) {
+                return response()->json([
+                    'error' => 'Credenciales incorrectas'
+                ], 401);
+            }
+
+            return response()->json([
+                'error' => 'Error al iniciar sesión',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Logout
+     */
+    public function logout(Request $request)
+    {
+        try {
+            $token = $request->bearerToken();
+            if ($token) {
+                $this->firebaseService->deleteToken($token);
+            }
+            
+            return response()->json([
+                'message' => 'Logout exitoso'
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Error al cerrar sesión',
+                'message' => $e->getMessage()
+            ], 500);
         }
     }
 }

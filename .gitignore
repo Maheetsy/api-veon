@@ -63,3 +63,4 @@ google-credentials.json
 /bootstrap/cache/*
 /storage/framework/cache/*
 /storage/framework/sessions/*
+veon_app_debug/
