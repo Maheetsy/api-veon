@@ -1,26 +1,17 @@
 <?php
-
 namespace App\Services;
-
 use Google\Cloud\Firestore\FirestoreClient;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Kreait\Firebase\Factory;
 use Illuminate\Support\Facades\Http;
-
 class FirebaseService
 {
     protected $db;
     protected $auth;
     protected $apiKey;
-
     public function __construct()
     {
-        // ANTES:
-// $keyFilePath = storage_path('app/firebase_credentials.json');
-
-// AHORA (Copia y pega esto):
-        #$keyFilePath = env('FIREBASE_CREDENTIALS_PATH', storage_path('app/firebase_credentials.json'));
         $keyFilePath = storage_path('app/firebase_credentials.json');
         
         if (!file_exists($keyFilePath)) {
@@ -40,9 +31,7 @@ class FirebaseService
         // Get Web API Key from env
         $this->apiKey = env('FIREBASE_API_KEY');
     }
-
     // --- User Methods ---
-
     public function createUser(array $data)
     {
         // 1. Create user in Firebase Authentication
@@ -53,74 +42,72 @@ class FirebaseService
             'displayName' => $data['name'],
             'disabled' => false,
         ];
-
         try {
             $createdUser = $this->auth->createUser($userProperties);
             $firebaseUid = $createdUser->uid;
         } catch (\Exception $e) {
             throw new \Exception('Error creating user in Firebase Auth: ' . $e->getMessage());
         }
-
-        // 2. Create user document in Firestore (without password)
+        // 2. Create user document in Firestore
         $collection = $this->db->collection('users');
         $now = new \DateTime();
         
         $userData = [
-            'id' => $firebaseUid, // Sync ID with Auth UID
+            'id' => $firebaseUid,
             'name' => $data['name'],
             'email' => $data['email'],
+            'role' => $data['role'] ?? 'vendedor', // Default role
             'createdAt' => $now,
             'updatedAt' => $now,
         ];
-
-        // Use set() with the UID as document ID
         $collection->document($firebaseUid)->set($userData);
-
         return [
             'id' => $firebaseUid,
             'name' => $data['name'],
             'email' => $data['email'],
+            'role' => $userData['role'],
             'createdAt' => $now->format('Y-m-d H:i:s'),
             'updatedAt' => $now->format('Y-m-d H:i:s'),
         ];
     }
-
     public function loginUser(string $email, string $password)
     {
         if (!$this->apiKey) {
             throw new \Exception('FIREBASE_API_KEY not set in .env');
         }
-
-        // Verify password using Firebase REST API
         $response = Http::post('https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' . $this->apiKey, [
             'email' => $email,
             'password' => $password,
             'returnSecureToken' => true,
         ]);
-
         if ($response->failed()) {
             throw new \Exception('Invalid credentials or Firebase error: ' . $response->body());
         }
-
         $authData = $response->json();
         $uid = $authData['localId'];
-
-        // Get user details from Firestore
+        // Get user details from Firestore (includes role)
         $user = $this->findUserById($uid);
-
         if (!$user) {
-            // If user exists in Auth but not in Firestore (legacy?), create it
             $user = [
                 'id' => $uid,
                 'email' => $email,
                 'name' => $authData['displayName'] ?? 'User',
+                'role' => 'vendedor', // Fallback role
             ];
         }
-
         return $user;
     }
-
-    public function findUserByEmail(string $email)
+    public function findUserById(string $id)
+    {
+        $doc = $this->db->collection('users')->document($id)->snapshot();
+        if ($doc->exists()) {
+            $data = $doc->data();
+            $data['id'] = $doc->id();
+            return $this->normalizeData($data);
+        }
+        return null;
+    }
+     public function findUserByEmail(string $email)
     {
         $collection = $this->db->collection('users');
         $query = $collection->where('email', '=', $email)->documents();
@@ -133,18 +120,6 @@ class FirebaseService
 
         return null;
     }
-
-    public function findUserById(string $id)
-    {
-        $doc = $this->db->collection('users')->document($id)->snapshot();
-        if ($doc->exists()) {
-            $data = $doc->data();
-            $data['id'] = $doc->id();
-            return $this->normalizeData($data);
-        }
-        return null;
-    }
-
     public function updateUserPassword(string $uid, string $newPassword)
     {
         try {
@@ -198,9 +173,7 @@ class FirebaseService
             $token->reference()->delete();
         }
     }
-
     // --- Helper ---
-
     private function normalizeData(array $data)
     {
         foreach ($data as $key => $value) {
@@ -210,9 +183,6 @@ class FirebaseService
         }
         return $data;
     }
-
-    // --- Token Methods ---
-
     public function createToken(string $userId)
     {
         $token = Str::random(64);
@@ -226,19 +196,6 @@ class FirebaseService
         return $token;
     }
 
-    public function verifyToken(string $token)
-    {
-        $hashedToken = hash('sha256', $token);
-        $query = $this->db->collection('personal_access_tokens')
-            ->where('token', '=', $hashedToken)
-            ->documents();
-
-        foreach ($query as $document) {
-            return $document->data()['user_id'];
-        }
-
-        return null;
-    }
 
     public function deleteToken(string $token)
     {
@@ -251,9 +208,19 @@ class FirebaseService
             $document->reference()->delete();
         }
     }
-
-    // --- Provider Methods ---
-
+    
+    // Para referencia, aquí están los métodos de token necesarios para el middleware:
+    public function verifyToken(string $token)
+    {
+        $hashedToken = hash('sha256', $token);
+        $query = $this->db->collection('personal_access_tokens')
+            ->where('token', '=', $hashedToken)
+            ->documents();
+        foreach ($query as $document) {
+            return $document->data()['user_id'];
+        }
+        return null;
+    }
     public function createProvider(array $data)
     {
         $now = new \DateTime();
